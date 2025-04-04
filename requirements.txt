@@ -1,0 +1,46 @@
+# Core data science packages
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Jupyter and notebook support
+jupyter>=1.0.0
+ipykernel>=6.0.0
+notebook>=6.5.0
+ipython>=8.0.0
+
+# Machine learning
+scikit-learn>=1.2.0
+torch>=2.0.0
+transformers>=4.30.0
+
+# LangChain and related packages
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-core>=0.1.10
+langchain-openai>=0.0.2
+chromadb>=0.4.22
+tiktoken>=0.5.2
+pydantic>=2.5.0
+
+# OpenAI
+openai>=1.12.0
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.65.0
+
+# Google Cloud packages
+google-cloud-bigquery==3.11.4
+sqlalchemy-bigquery==1.4.4
+db-dtypes==1.1.1
+google-cloud-core==2.3.3
+
+# Added from the code block
+tabulate==0.9.0
+numpy==1.24.3
+langchain==0.0.267
+openai==0.27.8
+python-dotenv==1.0.0
+sqlalchemy>=2.0.0 
