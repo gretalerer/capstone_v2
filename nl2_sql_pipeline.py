@@ -85,7 +85,7 @@ def execute_query(sql_query: str) -> str:
     try:
         query_job = client.query(sql_query)
         results_df = query_job.result().to_dataframe()
-        results_markdown = results_df.to_markdown()
+        results_markdown = results_df.head(20).iloc[:, :10].to_markdown()
         return results_markdown
     except Exception as e:
         return f"❌ Error: {str(e)}"
