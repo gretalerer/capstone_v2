@@ -26,7 +26,9 @@ import langgraph.graph as lg
 import os
 from tavily import TavilyClient
 from dotenv import load_dotenv
-from nl2_sql_pipeline import analyze_initial_sql_node
+from tools.nl2sql_tools import write_query, execute_query, summarize_result
+# Commenting out problematic import
+# from nl2_sql_pipeline import analyze_initial_sql_node
 import pandas as pd
 
 # Load environment variables
@@ -57,19 +59,32 @@ class GraphState(TypedDict):
     answer: str
 
 # Initial RAG corpus
-docs = []
+docs = [
+    "Initial document to prevent empty embeddings error. This is a placeholder that can be replaced with real content."
+]
 
 # Create vector store
 documents = [Document(page_content=text) for text in docs]
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=0)
 doc_splits = text_splitter.split_documents(documents)
-vectorstore = Chroma.from_documents(documents=doc_splits, embedding=OpenAIEmbeddings())
+
+# Initialize vectorstore with documents or create an empty one safely
+embedding = OpenAIEmbeddings()
+if doc_splits:
+    vectorstore = Chroma.from_documents(documents=doc_splits, embedding=embedding)
+else:
+    # Create an empty Chroma collection with at least one document to avoid the empty embeddings error
+    dummy_doc = Document(page_content="Dummy document to initialize vectorstore")
+    dummy_splits = text_splitter.split_documents([dummy_doc])
+    vectorstore = Chroma.from_documents(documents=dummy_splits, embedding=embedding)
+
 retriever = vectorstore.as_retriever()
 
 print("✅ Vectorstore initialized.")
 
 # %%
 # NL2SQL Functions
+
 def write_query(question: str) -> str:
     prompt = f"""
     You are an AI that generates SQL queries for a BigQuery database.
@@ -117,31 +132,6 @@ def execute_query(sql_query: str) -> str:
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
-def summarize_result(sql_query: str, results: str) -> str:
-    if "❌ Error" in results:
-        return "I couldn't process the query due to an error."
-
-    prompt = f"""
-    You are a data analyst. Based on the following SQL query and its output, write a straightforward natural language answer that directly communicates the query result.
-
-    **SQL Query:** 
-    ```sql
-    {sql_query}
-    ```
-
-    **Results:**
-    {results}
-
-    **Rules:**
-    - Write in a conversational style.
-    - Do not give an opinion or interpretation.
-
-    Example:
-    China was the country with the highest number of orders, with a total of 42,355 orders.
-    """
-    response = llm_large.invoke(prompt)
-    return response.content.strip()
-    
 
 # %%
 # Question Rewriter (Multi-hop RAG)
@@ -170,7 +160,7 @@ rag_chain = causal_prompt | llm | StrOutputParser()
 
 # Hallucination Grader (Self-RAG)
 class GradeHallucinations(BaseModel):
-    binary_score: str = Field(description="'yes' if grounded, 'no' if hallucinated")
+    binary_score: str = Field(description="'yes' if hallucinated, 'no' if grounded")
 hallucination_prompt = ChatPromptTemplate.from_messages([
     ("system", "Check if the generation is grounded in the facts. Score 'yes' or 'no'."),
     ("human", "Facts: {documents}\nGeneration: {generation}")
@@ -286,7 +276,7 @@ def multi_hop_retrieve(state):
 
 def decide_to_continue(state):
     print(f"\n[DECIDE] Hallucination: {state['hallucination']} | Answer: {state['answer']} | Iteration: {state['iteration']}")
-    if state["hallucination"] == "no" or state["answer"] == "no":
+    if state["hallucination"] == "yes" or state["answer"] == "no":
         if state["iteration"] < 3:
             next_step = "multi_hop_retrieve" if state.get("subquestions") else "generate_subquestions"
             print(f"[DECIDE] Continuing to: {next_step}")
@@ -295,6 +285,24 @@ def decide_to_continue(state):
         return "end"
     print("[DECIDE] Scores are good, ending")
     return "end"
+
+# Replacement for analyze_initial_sql_node
+def analyze_initial_sql_node(state):
+    initial_sql_query = write_query(state["question"])
+    initial_sql_results = execute_query(initial_sql_query)
+    initial_sql_summary = summarize_result(initial_sql_query, initial_sql_results)
+    if "error" not in initial_sql_summary.lower():
+        state["initial_answer"] = initial_sql_summary
+    else:
+        state["initial_answer"] = "I couldn't process the query due to an error."
+    documents = [state["initial_answer"]]
+    
+    """A simple replacement for the imported analyze_initial_sql_node function.
+    This function just passes the initial question directly to the next step."""
+    print(f"\n\U0001F9FE Initial Summary:")
+    print(f"Starting query analysis for: {state['question']}")
+    print("\n✅ Node completed: initial_query")
+    return {**state, "documents": documents, "initial_answer": initial_sql_summary}
 
 # Build Graph
 workflow = lg.StateGraph(GraphState)
@@ -319,7 +327,7 @@ print("✅ Graph compiled with web search.")
 
 # %%
 # Run the Graph
-initial_state = {"question": "How many orders were there in January 2024?", "iteration": 0}
+initial_state = {"question": "Which gender bought more products?", "iteration": 0}
 result = app.invoke(initial_state)
 print("Final Answer:", result["generation"])
 print("Documents Used:", result["documents"])
