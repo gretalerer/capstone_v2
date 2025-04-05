@@ -26,6 +26,8 @@ import langgraph.graph as lg
 import os
 from tavily import TavilyClient
 from dotenv import load_dotenv
+from nl2_sql_pipeline import analyze_initial_sql_node
+import pandas as pd
 
 # Load environment variables
 load_dotenv()
@@ -41,28 +43,21 @@ db = SQLDatabase.from_uri(f"bigquery://{project_id}")
 # Initialize LLMs
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 llm_fast = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+llm_large = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0)
 
 # Define Graph State
 class GraphState(TypedDict):
     question: str
+    initial_answer: str
     generation: str
     documents: List[str]
     subquestions: List[str]
     iteration: int
+    hallucination: str
+    answer: str
 
 # Initial RAG corpus
-docs = [
-    'The product "Collections Etc - Tanya Circles V-Neck Dress" had the highest number of sales in January 2024, with a total of 2 sales.',
-    'The top country for sales in January 2024 was the United States, with a total of 2 sales.',
-    'In January 2024, the total sales for the product "Collections Etc - Tanya Circles V-Neck Dress" was $27.94.',
-    'Customers who purchased the "Tanya Circles V-Neck Dress" also bought items such as leggings, jackets, and Bermuda shorts.',
-    'The average discount applied to women’s dresses in January 2024 was 15%.',
-    'January 2024 saw a promotional campaign focused on winter apparel, including dresses and sweaters.',
-    'Social media engagement for the "Tanya Circles V-Neck Dress" peaked during the second week of January.',
-    'Compared to January 2023, sales for the "Tanya Circles V-Neck Dress" increased by 20%.',
-    'The product received an average customer rating of 4.8 stars out of 5 based on 9 reviews.',
-    'Inventory levels for the "Tanya Circles V-Neck Dress" were higher than average, with sufficient stock in most regions.'
-]
+docs = []
 
 # Create vector store
 documents = [Document(page_content=text) for text in docs]
@@ -89,19 +84,35 @@ def write_query(question: str) -> str:
     - **Return only the SQL query.** No explanations.
     - The SQL query must be valid BigQuery SQL.
     - **Do not assume unknown columns.**
+    - By default, limit the results to 5 rows using LIMIT 5, unless the user specifically asks for more rows.
     
     Example Format:
-    SELECT column FROM table WHERE condition;
+    SELECT column FROM table WHERE condition LIMIT 5;
     """
     raw_result = llm.invoke(prompt)
 
     sql_query = raw_result.content.strip().replace("```sql", "").replace("```", "").strip()
+    return sql_query
 
 def execute_query(sql_query: str) -> str:
     try:
         query_job = client.query(sql_query)
         results_df = query_job.result().to_dataframe()
+        
+        # If results are too large, truncate to first 100 rows
+        if len(results_df) > 100:
+            print("[EXECUTE] Results too large, truncating to first 100 rows")
+            results_df = results_df.head(100)
+            
+        # Convert to markdown with limited precision for numeric columns
+        pd.set_option('display.precision', 2)
         results_markdown = results_df.to_markdown()
+        
+        # If markdown is still too large, truncate it
+        if len(results_markdown) > 10000:
+            print("[EXECUTE] Markdown too large, truncating to first 10000 characters")
+            results_markdown = results_markdown[:10000] + "\n... (results truncated)"
+            
         return results_markdown
     except Exception as e:
         return f"❌ Error: {str(e)}"
@@ -128,7 +139,7 @@ def summarize_result(sql_query: str, results: str) -> str:
     Example:
     China was the country with the highest number of orders, with a total of 42,355 orders.
     """
-    response = llm_fast.invoke(prompt)
+    response = llm_large.invoke(prompt)
     return response.content.strip()
     
 
@@ -145,8 +156,8 @@ class GradeDocuments(BaseModel):
     binary_score: str = Field(description="'yes' if relevant, 'no' if not")
 structured_llm_grader = llm.with_structured_output(GradeDocuments)
 grade_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Assess if the document supports a causal explanation for the question. Mark 'yes' if it provides context or factors, 'no' if irrelevant."),
-    ("human", "Document: {document}\nQuestion: {question}")
+    ("system", "Assess if the document supports a causal explanation for given answer to the question. Mark 'yes' if it provides context or factors, 'no' if irrelevant."),
+    ("human", "Document: {document}\n Question: {question}\n Answer: {initial_answer}")
 ])
 retrieval_grader = grade_prompt | structured_llm_grader
 
@@ -192,7 +203,11 @@ def retrieve(state):
     docs = retriever.invoke(rewritten_question)
     graded_docs = []
     for doc in docs:
-        score = retrieval_grader.invoke({"document": doc.page_content, "question": state["question"]}).binary_score
+        score = retrieval_grader.invoke({
+            "document": doc.page_content, 
+            "question": state["question"],
+            "initial_answer": state.get("initial_answer", "")
+        }).binary_score
         print(f"[RETRIEVE] Document: {doc.page_content[:50]}... | Relevant? {score}")
         if score == "yes":
             graded_docs.append(doc.page_content)
@@ -206,7 +221,12 @@ def retrieve(state):
         if "error" not in summary.lower():
             graded_docs = [summary]
     print(f"[RETRIEVE] Retrieved {len(graded_docs)} documents")
-    return {"documents": graded_docs, "question": state["question"], "iteration": state.get("iteration", 0)}
+    return {
+        "documents": graded_docs, 
+        "question": state["question"], 
+        "iteration": state.get("iteration", 0),
+        "initial_answer": state.get("initial_answer", "")
+    }
 
 def web_search(state):
     if state["documents"] and all("error" in doc.lower() for doc in state["documents"]):
@@ -278,27 +298,29 @@ def decide_to_continue(state):
 
 # Build Graph
 workflow = lg.StateGraph(GraphState)
+workflow.add_node("initial_query", analyze_initial_sql_node)
 workflow.add_node("retrieve", retrieve)
 workflow.add_node("web_search", web_search)
 workflow.add_node("generate", generate)
 workflow.add_node("grade", grade)
 workflow.add_node("generate_subquestions", generate_subquestions)
 workflow.add_node("multi_hop_retrieve", multi_hop_retrieve)
+workflow.add_edge("initial_query", "retrieve")
 workflow.add_edge("retrieve", "web_search")
 workflow.add_edge("web_search", "generate")
 workflow.add_edge("generate", "grade")
 workflow.add_conditional_edges("grade", decide_to_continue, {"multi_hop_retrieve": "multi_hop_retrieve", "generate_subquestions": "generate_subquestions", "end": lg.END})
 workflow.add_edge("generate_subquestions", "multi_hop_retrieve")
 workflow.add_edge("multi_hop_retrieve", "generate")
-workflow.set_entry_point("retrieve")
+workflow.set_entry_point("initial_query")
 app = workflow.compile()
 
 print("✅ Graph compiled with web search.")
 
 # %%
 # Run the Graph
-initial_state = {"question": "Why was the top selling product in January 2024?", "iteration": 0}
-result = app.invoke(initial_stated)
+initial_state = {"question": "How many orders were there in January 2024?", "iteration": 0}
+result = app.invoke(initial_state)
 print("Final Answer:", result["generation"])
 print("Documents Used:", result["documents"])
 
