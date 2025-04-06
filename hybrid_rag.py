@@ -69,13 +69,13 @@ class GradeDocuments(BaseModel):
 
 structured_llm_grader = llm.with_structured_output(GradeDocuments)
 grade_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Assess if the document supports a causal explanation for given answer to the question."),
-    ("human", "Document: {document}\n Question: {question}\n Answer: {initial_answer}")
+    ("system", "Assess if the document either provides an answer to the question or supports a causal explanation for the given answer to the question."),
+    ("human", "Document: {document}\n Question: {question}\n")
 ])
 retrieval_grader = grade_prompt | structured_llm_grader
 
 causal_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Generate a causal insight based strictly on the context. Avoid speculation."),
+    ("system", "Generate an answer and a causal explanation for the answer based strictly on the information present in the documents. Avoid speculation. If no supporting data is present, only answer the question. "),
     ("human", "Question: {question}\nContext: {context}\nCausal Insight:")
 ])
 rag_chain = causal_prompt | llm | StrOutputParser()
@@ -84,8 +84,8 @@ class GradeHallucinations(BaseModel):
     binary_score: str = Field(description="'yes' if hallucinated, 'no' if grounded")
 
 hallucination_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Check if the generation is grounded in the facts."),
-    ("human", "Facts: {documents}\nGeneration: {generation}")
+    ("system", "Assess whether everything on the following generated statement is present on the facts in the documents. Everything in the statement should be traced back to the documents."),
+    ("human", "Documents: {documents}\n Generation: {generation}")
 ])
 hallucination_grader = hallucination_prompt | structured_llm_grader
 
@@ -93,7 +93,7 @@ class GradeAnswer(BaseModel):
     binary_score: str = Field(description="'yes' if addresses question, 'no' if not")
 
 answer_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Assess if the answer resolves the question."),
+    ("system", "Assess if the answer explains the question."),
     ("human", "Question: {question}\nGeneration: {generation}")
 ])
 answer_grader = answer_prompt | structured_llm_grader
@@ -116,6 +116,8 @@ def analyze_initial_sql_node(state):
 def retrieve(state):
     rewritten_question = question_rewriter.invoke({"question": state["question"]})
     docs = retriever.invoke(rewritten_question)
+    docs.append(Document(page_content=state.get("initial_answer", "")))
+
     graded_docs = []
     for doc in docs:
         score = retrieval_grader.invoke({
@@ -178,26 +180,23 @@ def final_synthesis(state):
     }
 
 def grade(state):
-    generation_text = state["generation"].lower()
     hallucination_score = hallucination_grader.invoke({
         "documents": state["documents"],
         "generation": state["generation"]
     }).binary_score
-    if all(keyword in generation_text for keyword in ["men", "women", "bought"]):
-        answer_score = "yes"
-    elif any(phrase in generation_text for phrase in ["91,210", "89,790", "categories like"]):
-        answer_score = "yes"
-    else:
-        answer_score = answer_grader.invoke({
-            "question": state["question"],
-            "generation": state["generation"]
-        }).binary_score
+    
+    answer_score = answer_grader.invoke({
+        "question": state["question"],
+        "generation": state["generation"]
+    }).binary_score
+    
     return {
         **state,
         "hallucination": hallucination_score,
         "answer": answer_score,
         "iteration": state["iteration"] + 1
     }
+
 
 def generate_subquestions(state):
     print(f"\n[SUBQUESTIONS] Generating subquestions for: {state['generation'][:50]}...")
@@ -241,7 +240,7 @@ workflow.set_entry_point("initial_query")
 app = workflow.compile()
 
 # %%
-initial_state = {"question": "Why are sales from the intimates category so high?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
+initial_state = {"question": "How were sales in 2024 compared to 2023?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
 result = app.invoke(initial_state)
 print("Final Answer:", result["generation"])
 print("Documents Used:", result["documents"])
