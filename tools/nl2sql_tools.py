@@ -39,7 +39,6 @@ def write_query(question: str) -> str:
     SELECT column FROM table WHERE condition LIMIT 5;
     """
     raw_result = llm.invoke(prompt)
-
     sql_query = raw_result.content.strip().replace("```sql", "").replace("```", "").strip()
     return sql_query
 
@@ -66,13 +65,15 @@ def execute_query(sql_query: str) -> str:
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
-def summarize_result(sql_query: str, results: str) -> str:
+def summarize_result(sql_query: str, results: str, question: str) -> str:
     if "❌ Error" in results:
         return "I couldn't process the query due to an error."
 
     prompt = f"""
     You are a data analyst. Based on the following SQL query and its output, write a straightforward natural language answer that directly communicates the query result.
 
+    **User question:** "{question}"
+    
     **SQL Query:** 
     ```sql
     {sql_query}
