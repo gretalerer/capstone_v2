@@ -23,6 +23,8 @@ import os
 from tavily import TavilyClient
 import pandas as pd
 from tools.nl2sql_tools import write_query, execute_query, summarize_result
+import numpy as np
+from langchain_core.documents import Document
 
 # %%
 load_dotenv()
@@ -61,8 +63,17 @@ retriever = vectorstore.as_retriever()
 
 # Prompts and chains
 rewrite_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Rewrite the user question to optimize it for retrieval, focusing on causal factors and broader context."),
-    ("human", "Original question: {question}\nRewritten query:")
+    ("system", """Rewrite the user question to optimize it for retrieval while maintaining its original intent.
+    The rewritten query should:
+    1. Keep the core question and its main objective
+    2. Incorporate specific aspects from the gap analysis that need to be addressed
+    3. Focus on retrieving information that fills the identified gaps
+    4. Maintain the original context and scope of the question
+    
+    Return only the rewritten question, without any explanations."""),
+    ("human", """Original question: {question}
+    Gap Analysis: {gap_analysis}
+    Rewritten query:""")
 ])
 question_rewriter = rewrite_prompt | llm | StrOutputParser()
 
@@ -145,23 +156,92 @@ def analyze_initial_sql_node(state):
         "documents": [summary],
         "came_from_subq": False
     }
+    
+
+def cosine_similarity(v1, v2):
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+def filter_by_similarity(doc_embeddings, query_embedding, docs, similarity_threshold=0.7):
+    """
+    Filters out documents below a certain cosine similarity threshold.
+    Returns (filtered_docs, filtered_embeddings)
+    """
+    filtered_docs = []
+    filtered_embeddings = []
+    for doc, emb in zip(docs, doc_embeddings):
+        sim = cosine_similarity(emb, query_embedding)
+        if sim >= similarity_threshold:
+            filtered_docs.append(doc)
+            filtered_embeddings.append(emb)
+    return filtered_docs, filtered_embeddings
+
+def deduplicate_docs(docs, embeddings, dedup_threshold=0.9):
+    """
+    Removes near-duplicate documents based on embedding similarity among themselves.
+    Returns deduplicated_docs, deduplicated_embeddings
+    """
+    used = [False] * len(docs)
+    deduped_docs = []
+    deduped_embs = []
+    for i, emb_i in enumerate(embeddings):
+        if used[i]:
+            continue
+        # Keep this doc
+        deduped_docs.append(docs[i])
+        deduped_embs.append(embeddings[i])
+        for j in range(i + 1, len(embeddings)):
+            if not used[j]:
+                sim = cosine_similarity(emb_i, embeddings[j])
+                if sim >= dedup_threshold:
+                    used[j] = True
+    return deduped_docs, deduped_embs
 
 def retrieve(state):
-    rewritten_question = question_rewriter.invoke({"question": state["question"]})
-    docs = retriever.invoke(rewritten_question)
-    docs.append(Document(page_content=state.get("initial_answer", "")))
-
+    """
+    Combined retrieval approach:
+    1. Rewrite the query using an LLM (question rewriter).
+    2. Retrieve from vectorstore (Chroma).
+    3. Filter with an LLM-based retrieval grader (yes/no).
+    4. Apply a second pass for vector similarity thresholding.
+    5. Deduplicate documents that are near-duplicates.
+    """
+    # 1. Rewrite question
+    rewritten_question = question_rewriter.invoke({
+        "question": state["question"],
+        "gap_analysis": state.get("gap_analysis", "No gap analysis available.")
+    })
+    rewritten_query = rewritten_question.strip()
+    
+    # 2. Retrieve from vectorstore (Chroma)
+    candidate_docs = vectorstore.similarity_search(rewritten_query, k=10)
+    # Convert to raw text docs for consistency
+    candidate_texts = [doc.page_content for doc in candidate_docs]
+    
+    # 3. LLM-based retrieval grader
     graded_docs = []
-    for doc in docs:
+    for doc_text in candidate_texts:
         score = retrieval_grader.invoke({
-            "document": doc.page_content,
+            "document": doc_text,
             "question": state["question"],
             "initial_answer": state.get("initial_answer", "")
         }).binary_score
         if score == "yes":
-            graded_docs.append(doc.page_content)
+            graded_docs.append(doc_text)
+    
+    # 4. Vector similarity thresholding
+    # Create embeddings for graded docs and the query
+    query_emb = embedding.embed_query(rewritten_query)
+    doc_embs = [embedding.embed_query(d) for d in graded_docs]
+    docs_passed, embs_passed = filter_by_similarity(doc_embs, query_emb, graded_docs, similarity_threshold=0.7)
+    
+    # 5. Deduplicate near-duplicate documents
+    deduped_docs, deduped_embs = deduplicate_docs(docs_passed, embs_passed, dedup_threshold=0.9)
+    
+    # Combine with existing state's documents (if you want to keep them in context)
+    final_documents = list(state["documents"]) + deduped_docs
+    
     return {
-        "documents": graded_docs,
+        "documents": final_documents,
         "question": state["question"],
         "iteration": state.get("iteration", 0),
         "initial_answer": state.get("initial_answer", ""),
@@ -188,16 +268,34 @@ def generate(state):
     }
 
 def multi_hop_retrieve(state):
+    print(f"\n[MULTI-HOP] Retrieving for subquestions: {state['subquestions']}")
     sub_docs = []
     for subq in state["subquestions"]:
         sql_query = write_query(subq)
+        print(f"[MULTI-HOP] Subquestion SQL: {sql_query}")
         results = execute_query(sql_query)
+        print(f"[MULTI-HOP] Subquestion Result: {results[:50]}...")
         summary = summarize_result(sql_query, results)
-        sub_docs.append(summary if "error" not in summary.lower() else "No data found.")
+        if "error" not in summary.lower():
+            sub_docs.append(summary)
+        else:
+            print(f"[MULTI-HOP] SQL failed for {subq}, trying web search")
+            web_results = tavily.search(subq, max_results=1)["results"]
+            sub_docs.append(f"{web_results[0]['title']}: {web_results[0]['content'][:200]}..." if web_results else "No data found.")
+    
+    # Add new documents to vectorstore
+    if sub_docs:
+        new_docs = [Document(page_content=doc) for doc in sub_docs]
+        vectorstore.add_documents(new_docs)
+        print(f"[MULTI-HOP] Added {len(new_docs)} new documents to vectorstore")
+    
+    combined_docs = state["documents"] + sub_docs
+    print(f"[MULTI-HOP] Total documents after multi-hop: {len(combined_docs)}")
     return {
-        **state,
-        "documents": state["documents"] + sub_docs,
-        "came_from_subq": False
+        "documents": combined_docs,
+        "question": state["question"],
+        "generation": state["generation"],
+        "iteration": state["iteration"]
     }
 
 def analyze_causal_gaps(question, answer, documents):
@@ -351,12 +449,12 @@ workflow.add_conditional_edges("grade", decide_to_continue, {
     "end": lg.END
 })
 workflow.add_edge("generate_subquestions", "multi_hop_retrieve")
-workflow.add_edge("multi_hop_retrieve", "generate")
+workflow.add_edge("multi_hop_retrieve", "retrieve")
 workflow.set_entry_point("initial_query")
 app = workflow.compile()
 
 # %%
-initial_state = {"question": "What is the percentage of orders that were returned in 2024?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
+initial_state = {"question": "Top selling product?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
 result = app.invoke(initial_state)
 print("Final Answer:", result["generation"])
 print("Documents Used:", result["documents"])
