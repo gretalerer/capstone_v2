@@ -48,6 +48,8 @@ class GraphState(TypedDict):
     hallucination: str
     answer: str
     came_from_subq: bool
+    reflection: str  # Stores the reflection analysis (ISREL, ISSUP, ISUSE)
+    gap_analysis: str  # Stores the analysis of causal gaps in the explanation
 
 # Vectorstore setup
 embedding = OpenAIEmbeddings()
@@ -75,8 +77,23 @@ grade_prompt = ChatPromptTemplate.from_messages([
 retrieval_grader = grade_prompt | structured_llm_grader
 
 causal_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Generate an answer and a causal explanation for the answer based strictly on the information present in the documents. Avoid speculation. If no supporting data is present, only answer the question. "),
-    ("human", "Question: {question}\nContext: {context}\nCausal Insight:")
+    ("system", """Generate a factual answer that enhances the initial response with relevant information. 
+    Follow these rules strictly:
+    1. Start with the initial answer as your first sentence
+    2. Only include information that is explicitly present in the documents
+    3. Focus on factual connections between data points
+    4. If a gap analysis is provided, use it to identify what additional factual information would be relevant
+    5. Do not speculate about causes or reasons
+    6. Provide only the essential data points and omit extraneous narrative details.
+    7. Do not include flowery language or unnecessary details
+    
+    Your answer should be direct and factual, connecting relevant data points without speculation."""),
+    ("human", """Question: {question}
+    Context: {context}
+    Gap Analysis: {gap_analysis}
+    Initial Answer: {initial_answer}
+    
+    Generate a factual answer with relevant information:""")
 ])
 rag_chain = causal_prompt | llm | StrOutputParser()
 
@@ -92,11 +109,27 @@ hallucination_grader = hallucination_prompt | structured_llm_grader
 class GradeAnswer(BaseModel):
     binary_score: str = Field(description="'yes' if addresses question, 'no' if not")
 
+class ReflectionTokens(BaseModel):
+    isrel: str = Field(description="'yes' if evidence directly pertains to question, 'no' if not")
+    issup: str = Field(description="'yes' if claims are grounded in documents, 'no' if not")
+    isuse: int = Field(description="Score from 1-5 indicating how well the answer provides causal explanation")
+
 answer_prompt = ChatPromptTemplate.from_messages([
     ("system", "Assess if the answer explains the question."),
     ("human", "Question: {question}\nGeneration: {generation}")
 ])
 answer_grader = answer_prompt | structured_llm_grader
+
+reflection_prompt = ChatPromptTemplate.from_messages([
+    ("system", """Analyze the answer for three aspects:
+    1. ISREL: Does the evidence directly pertain to the question?
+    2. ISSUP: Is each claim or fact in the answer fully grounded in the retrieved documents?
+    3. ISUSE: Does the answer provide a causal explanation? Rate from 1 (poor) to 5 (comprehensive).
+    
+    Return a structured response with these three fields."""),
+    ("human", "Question: {question}\nAnswer: {generation}\nDocuments: {documents}")
+])
+reflection_grader = reflection_prompt | llm.with_structured_output(ReflectionTokens)
 
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
@@ -137,7 +170,15 @@ def retrieve(state):
 
 def generate(state):
     context = "\n".join(state["documents"]) if state["documents"] else "No relevant data."
-    generation = rag_chain.invoke({"context": context, "question": state["question"]})
+    gap_analysis = state.get("gap_analysis", "No gap analysis available.")
+    initial_answer = state.get("initial_answer", "")
+    
+    generation = rag_chain.invoke({
+        "context": context, 
+        "question": state["question"],
+        "gap_analysis": gap_analysis,
+        "initial_answer": initial_answer
+    })
     return {
         "generation": generation,
         "documents": state["documents"],
@@ -159,11 +200,46 @@ def multi_hop_retrieve(state):
         "came_from_subq": False
     }
 
+def analyze_causal_gaps(question, answer, documents):
+    gap_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Examine the answer and its supporting documents to identify gaps in the causal explanation. 
+        Specifically, determine which underlying factors, reasons, or contextual details are missing that would make 
+        the causal chain in the answer more comprehensive. Also, look for any contextual fallacies or omissions 
+        that might weaken the explanation.
+        
+        Provide a concise summary in one or two sentences outlining what additional evidence or details are needed 
+        to fill these gaps. Make sure not to repeat information already present in the retrieved documents."""),
+        ("human", """Analyze the following answer for the question: "{question}"
+
+        Answer: {generation}
+        Retrieved Documents: {documents}""")
+    ])
+    
+    gap_chain = gap_prompt | llm_fast | StrOutputParser()
+    return gap_chain.invoke({
+        "question": question,
+        "generation": answer,
+        "documents": documents
+    })
+
 def decide_to_continue(state):
-    if state["hallucination"] == "yes" or state["answer"] == "no":
+    reflection = state["reflection"]
+    
+    # Case A: Evidence is relevant and supported but lacks comprehensive causal explanation
+    if reflection.isrel == "yes" and reflection.issup == "yes" and reflection.isuse < 4:
         if state["iteration"] < 5:
-            return "multi_hop_retrieve" if state.get("came_from_subq") else "generate_subquestions"
+            print("\n[ANALYSIS] Answer is factually correct but lacks comprehensive causal explanation")
+            return "generate_subquestions"
         return "end"
+    
+    # Case B: Evidence is not relevant or not supported
+    elif reflection.isrel == "no" or reflection.issup == "no":
+        if state["iteration"] < 5:
+            print("\n[ANALYSIS] Answer lacks proper evidence support or relevance - regenerating")
+            return "regenerate"
+        return "end"
+    
+    # If we have good evidence and comprehensive explanation, we're done
     return "end"
 
 def final_synthesis(state):
@@ -190,20 +266,51 @@ def grade(state):
         "generation": state["generation"]
     }).binary_score
     
+    # Generate structured reflection tokens
+    reflection = reflection_grader.invoke({
+        "question": state["question"],
+        "generation": state["generation"],
+        "documents": state["documents"]
+    })
+    
+    print("\n[REFLECTION] Analysis:")
+    print(f"ISREL: {reflection.isrel}")
+    print(f"ISSUP: {reflection.issup}")
+    print(f"ISUSE: {reflection.isuse}")
+    
+    # Generate gap analysis if needed
+    gap_analysis = ""
+    if reflection.isrel == "yes" and reflection.issup == "yes" and reflection.isuse < 4:
+        gap_analysis = analyze_causal_gaps(state["question"], state["generation"], state["documents"])
+        print("[ANALYSIS] Gaps identified:", gap_analysis)
+    
     return {
         **state,
         "hallucination": hallucination_score,
         "answer": answer_score,
-        "iteration": state["iteration"] + 1
+        "iteration": state["iteration"] + 1,
+        "reflection": reflection,
+        "gap_analysis": gap_analysis
     }
-
 
 def generate_subquestions(state):
     print(f"\n[SUBQUESTIONS] Generating subquestions for: {state['generation'][:50]}...")
+    
+    # Include gap analysis in the prompt if available
+    gap_context = ""
+    if state.get("gap_analysis"):
+        gap_context = f"""
+        The following gaps were identified in the causal explanation:
+        {state['gap_analysis']}
+        
+        Generate questions that specifically target these gaps to fill in the missing causal factors.
+        """
+    
     prompt = f"""
     The objective is to find a causal explanation for the answer '{state['generation']}' to the question '{state['question']}'.
     The following data is present in the database: {db.get_table_info()}
-    Based on the generation, and the already retrieved context, what other intenral information is needed to find a causal explanation?
+    {gap_context}
+    Based on the generation, and the already retrieved context, what other internal information is needed to find a causal explanation?
     Formulate 2 follow-up questions that can be answered by the SQL database, looking to find other reasons that can explain the answer.
     - Focus on explaining causal factors or additional details.
     - Do not ask questions that are already answered in the retrieved context.
@@ -233,7 +340,6 @@ workflow.add_node("generate", generate)
 workflow.add_node("grade", grade)
 workflow.add_node("generate_subquestions", generate_subquestions)
 workflow.add_node("multi_hop_retrieve", multi_hop_retrieve)
-workflow.add_node("final_synthesis", final_synthesis)
 
 workflow.add_edge("initial_query", "retrieve")
 workflow.add_edge("retrieve", "generate")
@@ -241,11 +347,11 @@ workflow.add_edge("generate", "grade")
 workflow.add_conditional_edges("grade", decide_to_continue, {
     "generate_subquestions": "generate_subquestions",
     "multi_hop_retrieve": "multi_hop_retrieve",
+    "regenerate": "generate",
     "end": lg.END
 })
 workflow.add_edge("generate_subquestions", "multi_hop_retrieve")
-workflow.add_edge("multi_hop_retrieve", "final_synthesis")
-workflow.add_edge("final_synthesis", "generate")
+workflow.add_edge("multi_hop_retrieve", "generate")
 workflow.set_entry_point("initial_query")
 app = workflow.compile()
 
