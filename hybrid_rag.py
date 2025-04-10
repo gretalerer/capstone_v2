@@ -201,9 +201,19 @@ def grade(state):
 def generate_subquestions(state):
     print(f"\n[SUBQUESTIONS] Generating subquestions for: {state['generation'][:50]}...")
     prompt = f"""
-    Based on the generation '{state['generation']}', generate 2 follow-up questions for multi-hop reasoning using the SQL database or external sources.
-    - Focus on causal factors or additional details.
+    The objective is to find a causal explanation for the answer '{state['generation']}' to the question '{state['question']}'.
+    The following data is present in the database: {db.get_table_info()}
+    Based on the generation, and the already retrieved context, what other intenral information is needed to find a causal explanation?
+    Formulate 2 follow-up questions that can be answered by the SQL database, looking to find other reasons that can explain the answer.
+    - Focus on explaining causal factors or additional details.
+    - Do not ask questions that are already answered in the retrieved context.
     - Ensure they are answerable.
+    
+    Format your response exactly like this:
+    1. [First question]
+    2. [Second question]
+    
+    Do not include any other text or explanations in your response.
     """
     new_subquestions = llm_fast.invoke(prompt).content.split("\n")[:2]
     all_subquestions = state.get("all_subquestions", []) + new_subquestions
