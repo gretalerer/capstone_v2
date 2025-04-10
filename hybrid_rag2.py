@@ -169,10 +169,8 @@ def grade(state):
         Only say 'no' if it's purely descriptive or lacks supporting evidence.
         """
         
-        causal_result = causal_grader.invoke({
-            "question": state['question'],
-            "generation": causal_evaluation_prompt
-        })
+        # Pass the string directly to the grader
+        causal_result = causal_grader.invoke(causal_evaluation_prompt)
         causal_score = causal_result.binary_score
         print(f"[GRADE] Causal explanation score: {causal_score}")
     else:
@@ -385,6 +383,7 @@ def decide_next(state):
     
     decision = None
     
+    # First check if we have a factually correct answer
     if state["answer"] == "no" or state["hallucination"] == "yes":
         if state.get("iteration", 0) >= 3:
             decision = "end"
@@ -393,17 +392,21 @@ def decide_next(state):
             decision = "regenerate"
             reason = "Answer needs improvement"
     
+    # If answer is correct but we haven't done multi-hop yet
     elif not state.get("is_multi_hop", False):
         decision = "expand"
         reason = "Starting multi-hop expansion"
     
+    # If we're in multi-hop phase
     elif state.get("context_iterations", 0) < 3:
         if state.get("causal_explanation", "no") == "no":
-            decision = "continue_expansion"
-            reason = "Need better causal explanation"
+            # If causal explanation is missing, go back to retrieve_for_expansion
+            decision = "retrieve_expansion"
+            reason = "Need better causal explanation, analyzing gaps"
         else:
-            decision = "synthesize"
-            reason = "Good causal explanation achieved, moving to final synthesis"
+            # If we have good causal explanation, end
+            decision = "end"
+            reason = "Good causal explanation achieved"
     
     else:
         decision = "end"
