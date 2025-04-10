@@ -105,7 +105,7 @@ tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 def analyze_initial_sql_node(state):
     sql_query = write_query(state["question"])
     result = execute_query(sql_query)
-    summary = summarize_result(sql_query, result)
+    summary = summarize_result(sql_query, result, state["question"])
     return {
         **state,
         "initial_answer": summary,
@@ -151,7 +151,7 @@ def multi_hop_retrieve(state):
     for subq in state["subquestions"]:
         sql_query = write_query(subq)
         results = execute_query(sql_query)
-        summary = summarize_result(sql_query, results)
+        summary = summarize_result(sql_query, results, subq)
         sub_docs.append(summary if "error" not in summary.lower() else "No data found.")
     return {
         **state,
@@ -240,15 +240,11 @@ workflow.set_entry_point("initial_query")
 app = workflow.compile()
 
 # %%
-initial_state = {"question": "What is the percentage of orders that were returned in 2024?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
+initial_state = {"question": "How were sales in 2024 compared to 2023?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
 result = app.invoke(initial_state)
 print("Final Answer:", result["generation"])
 print("Documents Used:", result["documents"])
 print("Subquestions (Last Round):", result.get("subquestions", []))
 print("All Subquestions:", result.get("all_subquestions", []))
 
-# %%
-# Get the Mermaid code directly
-mermaid_code = app.get_graph().draw_mermaid()
-print(mermaid_code)
 # %%
