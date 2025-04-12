@@ -252,13 +252,49 @@ def generate(state):
     context = "\n".join(state["documents"]) if state["documents"] else "No relevant data."
     gap_analysis = state.get("gap_analysis", "No gap analysis available.")
     initial_answer = state.get("initial_answer", "")
+    previous_generation = state.get("generation", "")
     
-    generation = rag_chain.invoke({
-        "context": context, 
-        "question": state["question"],
-        "gap_analysis": gap_analysis,
-        "initial_answer": initial_answer
-    })
+    # Track iteration to adjust the prompt based on how many times we've generated
+    iteration = state.get("iteration", 0)
+    
+    # Create a more context-aware prompt that builds upon previous answers
+    generation_prompt = f"""
+    You are a data analyst creating a comprehensive answer to the question: "{state['question']}"
+    
+    INITIAL ANSWER:
+    {initial_answer}
+    
+    PREVIOUS GENERATION (if any):
+    {previous_generation}
+    
+    NEW INFORMATION FROM SUBQUESTIONS:
+    {context}
+    
+    GAP ANALYSIS:
+    {gap_analysis}
+    
+    ITERATION: {iteration}
+    
+    Your task is to create an IMPROVED answer that:
+    1. Builds upon the previous generation (if any) rather than starting from scratch
+    2. Incorporates the new information from subquestions to address the identified gaps
+    3. Provides a more comprehensive causal explanation of the observed patterns
+    4. Explicitly connects the new information to the original question
+    5. Highlights how the new information helps explain the "why" behind the patterns
+    
+    If this is the first generation (iteration 0), focus on providing a clear, factual answer.
+    If this is a subsequent generation (iteration > 0), focus on enhancing the previous answer with new insights.
+    
+    Structure your answer to show progression:
+    - Start with the core answer to the original question
+    - Then explain how the new information enhances our understanding
+    - Finally, synthesize the insights into a more comprehensive explanation
+    
+    Your answer should be clear, concise, and directly address the original question while incorporating all relevant new information.
+    """
+    
+    generation = llm.invoke(generation_prompt).content.strip()
+    
     return {
         "generation": generation,
         "documents": state["documents"],
@@ -404,19 +440,43 @@ def generate_subquestions(state):
         Generate questions that specifically target these gaps to fill in the missing causal factors.
         """
     
+    # Get previously asked questions to avoid repetition
+    previous_questions = state.get("all_subquestions", [])
+    previous_questions_text = "\n".join([f"- {q}" for q in previous_questions]) if previous_questions else "No previous questions have been asked yet."
+    
     prompt = f"""
     The objective is to find a causal explanation for the answer '{state['generation']}' to the question '{state['question']}'.
     The following data is present in the database: {db.get_table_info()}
     {gap_context}
-    Based on the generation, and the already retrieved context, what other internal information is needed to find a causal explanation?
-    Formulate 2 follow-up questions that can be answered by the SQL database, looking to find other reasons that can explain the answer.
-    - Focus on explaining causal factors or additional details.
-    - Do not ask questions that are already answered in the retrieved context.
-    - Ensure they are answerable.
+    
+    PREVIOUSLY ASKED QUESTIONS:
+    {previous_questions_text}
+    
+    Based on the generation, the already retrieved context, and the previously asked questions, formulate 2 NEW follow-up questions that will help EXPLAIN WHY the observed patterns exist.
+    
+    IMPORTANT GUIDELINES FOR SUBQUESTIONS:
+    1. Each question should investigate a potential CAUSAL FACTOR that might explain the observed patterns
+    2. Focus on EXPLANATORY VARIABLES that could influence the main metrics
+    3. Include specific time periods, locations, or identifiers to make questions precise
+    4. Questions should be directly translatable to SQL queries
+    5. DO NOT repeat or rephrase questions that have already been asked
+    6. Build upon previous questions - if a previous question revealed X, ask about Y that might be related to X
+    7. If a previous question didn't yield useful insights, try a different approach or angle
+    
+    Examples of GOOD causal questions that build on previous findings:
+    - If a previous question showed high delivery times in China: "What is the average distance from distribution centers to delivery locations in China compared to Brazil?"
+    - If a previous question showed peak hours impact: "How does the number of available delivery personnel during peak hours (9am-5pm) correlate with delivery times?"
+    - If a previous question showed order volume impact: "What is the ratio of orders to available delivery vehicles in each country?"
+    
+    Examples of BAD questions:
+    - "What is the average delivery time for orders by country?" (already answered in the initial response)
+    - "How many orders were delivered in July 2023?" (doesn't explain causality)
+    - "What is the total revenue for each country?" (not related to delivery times)
+    - Any question that simply rephrases a previously asked question
     
     Format your response exactly like this:
-    1. [First question]
-    2. [Second question]
+    1. [First new causal question]
+    2. [Second new causal question]
     
     Do not include any other text or explanations in your response.
     """
@@ -454,7 +514,7 @@ workflow.set_entry_point("initial_query")
 app = workflow.compile()
 
 # %%
-initial_state = {"question": "Top selling product?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
+initial_state = {"question": "What is the average delivery time for orders by country?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
 result = app.invoke(initial_state)
 print("Final Answer:", result["generation"])
 print("Documents Used:", result["documents"])
