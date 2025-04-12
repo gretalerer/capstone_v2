@@ -29,14 +29,20 @@ def write_query(question: str) -> str:
     **User question:** "{question}"
     
     **Rules:**
-    - You should write a query that answers the user question.
-    - **Return only the SQL query.** No explanations.
-    - The SQL query must be valid BigQuery SQL.
-    - **Do not assume unknown columns.**
-    - By default, limit the results to 5 rows using LIMIT 5, unless the user specifically asks for more rows.
+    - Write a valid BigQuery SQL query that answers the question
+    - Return only the SQL query, no explanations
+    - Do not assume unknown columns
+    - Sort intelligently based on question intent:
+      * DESC for "highest/most/top"
+      * ASC for "lowest/least/bottom"
+      * By date for trends
+      * By metric for averages/totals
+    - Limit results only when:
+      * Question specifies a number (e.g., "top 5")
+      * Question asks about extremes
+      * Data would be too large
     
-    Example Format:
-    SELECT column FROM table WHERE condition LIMIT 5;
+    Example: SELECT column FROM table ORDER BY metric DESC;
     """
     raw_result = llm.invoke(prompt)
 

@@ -108,28 +108,10 @@ causal_prompt = ChatPromptTemplate.from_messages([
 ])
 rag_chain = causal_prompt | llm | StrOutputParser()
 
-class GradeHallucinations(BaseModel):
-    binary_score: str = Field(description="'yes' if hallucinated, 'no' if grounded")
-
-hallucination_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Assess whether everything on the following generated statement is present on the facts in the documents. Everything in the statement should be traced back to the documents."),
-    ("human", "Documents: {documents}\n Generation: {generation}")
-])
-hallucination_grader = hallucination_prompt | structured_llm_grader
-
-class GradeAnswer(BaseModel):
-    binary_score: str = Field(description="'yes' if addresses question, 'no' if not")
-
 class ReflectionTokens(BaseModel):
     isrel: str = Field(description="'yes' if evidence directly pertains to question, 'no' if not")
     issup: str = Field(description="'yes' if claims are grounded in documents, 'no' if not")
     isuse: int = Field(description="Score from 1-5 indicating how well the answer provides causal explanation: 1=no causal information, 2=basic inferences only, 3=some retrieved data with inferences, 4=comprehensive retrieved data with good inferences, 5=complete causal explanation with multiple data sources")
-
-answer_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Assess if the answer explains the question."),
-    ("human", "Question: {question}\nGeneration: {generation}")
-])
-answer_grader = answer_prompt | structured_llm_grader
 
 reflection_prompt = ChatPromptTemplate.from_messages([
     ("system", """Analyze the answer for three aspects:
@@ -158,6 +140,7 @@ def analyze_initial_sql_node(state):
     return {
         **state,
         "initial_answer": summary,
+        "generation": summary,
         "documents": [summary],
         "came_from_subq": False
     }
@@ -217,8 +200,8 @@ def retrieve(state):
     })
     rewritten_query = rewritten_question.strip()
     
-    # 2. Retrieve from vectorstore (Chroma)
-    candidate_docs = vectorstore.similarity_search(rewritten_query, k=10)
+    # 2. Retrieve from vectorstore (Chroma) - INCREASED from 10 to 15 documents
+    candidate_docs = vectorstore.similarity_search(rewritten_query, k=15)
     # Convert to raw text docs for consistency
     candidate_texts = [doc.page_content for doc in candidate_docs]
     
@@ -233,20 +216,30 @@ def retrieve(state):
         if score == "yes":
             graded_docs.append(doc_text)
     
-    # 4. Vector similarity thresholding
+    # 4. Vector similarity thresholding - LOWERED threshold from 0.7 to 0.6 to include more documents
     # Create embeddings for graded docs and the query
     query_emb = embedding.embed_query(rewritten_query)
     doc_embs = [embedding.embed_query(d) for d in graded_docs]
-    docs_passed, embs_passed = filter_by_similarity(doc_embs, query_emb, graded_docs, similarity_threshold=0.7)
+    docs_passed, embs_passed = filter_by_similarity(doc_embs, query_emb, graded_docs, similarity_threshold=0.6)
     
-    # 5. Deduplicate near-duplicate documents
-    deduped_docs, deduped_embs = deduplicate_docs(docs_passed, embs_passed, dedup_threshold=0.9)
+    # 5. Deduplicate near-duplicate documents - INCREASED threshold from 0.9 to 0.95 to be more lenient
+    deduped_docs, deduped_embs = deduplicate_docs(docs_passed, embs_passed, dedup_threshold=0.95)
     
-    # Combine with existing state's documents (if you want to keep them in context)
+    # Combine with existing state's documents
     final_documents = list(state["documents"]) + deduped_docs
     
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_docs = []
+    for doc in final_documents:
+        if doc not in seen:
+            seen.add(doc)
+            unique_docs.append(doc)
+    
+    print(f"[RETRIEVAL] Retrieved {len(unique_docs)} unique documents")
+    
     return {
-        "documents": final_documents,
+        "documents": unique_docs,
         "question": state["question"],
         "iteration": state.get("iteration", 0),
         "initial_answer": state.get("initial_answer", ""),
@@ -318,18 +311,36 @@ def generate(state):
 def multi_hop_retrieve(state):
     print(f"\n[MULTI-HOP] Retrieving for subquestions: {state['subquestions']}")
     sub_docs = []
+    
+    # Process each subquestion
     for subq in state["subquestions"]:
-        sql_query = write_query(subq)
-        print(f"[MULTI-HOP] Subquestion SQL: {sql_query}")
-        results = execute_query(sql_query)
-        print(f"[MULTI-HOP] Subquestion Result: {results[:50]}...")
-        summary = summarize_result(sql_query, results)
-        if "error" not in summary.lower():
-            sub_docs.append(summary)
-        else:
-            print(f"[MULTI-HOP] SQL failed for {subq}, trying web search")
-            web_results = tavily.search(subq, max_results=1)["results"]
-            sub_docs.append(f"{web_results[0]['title']}: {web_results[0]['content'][:200]}..." if web_results else "No data found.")
+        print(f"[MULTI-HOP] Processing subquestion: {subq}")
+        
+        # Try SQL query first
+        try:
+            sql_query = write_query(subq)
+            print(f"[MULTI-HOP] Subquestion SQL: {sql_query}")
+            results = execute_query(sql_query)
+            print(f"[MULTI-HOP] Subquestion Result: {results[:50]}...")
+            summary = summarize_result(sql_query, results)
+            if "error" not in summary.lower():
+                sub_docs.append(summary)
+                print(f"[MULTI-HOP] Successfully retrieved SQL data for: {subq}")
+            else:
+                print(f"[MULTI-HOP] SQL failed for {subq}, trying web search")
+                # Try web search if SQL fails
+                web_response = tavily.search(subq, max_results=2, search_depth="advanced", include_answer="advanced")
+                if web_response.get("answer"):
+                    sub_docs.append(f"Web Search Answer: {web_response['answer']}")
+        except Exception as e:
+            print(f"[MULTI-HOP] Error processing SQL for {subq}: {str(e)}")
+            # Try web search if SQL fails
+            try:
+                web_response = tavily.search(subq, max_results=2, search_depth="advanced", include_answer="advanced")
+                if web_response.get("answer"):
+                    sub_docs.append(f"Web Search Answer: {web_response['answer']}")
+            except Exception as web_error:
+                print(f"[MULTI-HOP] Error with web search for {subq}: {str(web_error)}")
     
     # Add new documents to vectorstore
     if sub_docs:
@@ -337,10 +348,20 @@ def multi_hop_retrieve(state):
         vectorstore.add_documents(new_docs)
         print(f"[MULTI-HOP] Added {len(new_docs)} new documents to vectorstore")
     
+    # Combine with existing documents
     combined_docs = state["documents"] + sub_docs
-    print(f"[MULTI-HOP] Total documents after multi-hop: {len(combined_docs)}")
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_docs = []
+    for doc in combined_docs:
+        if doc not in seen:
+            seen.add(doc)
+            unique_docs.append(doc)
+    
+    print(f"[MULTI-HOP] Total unique documents after multi-hop: {len(unique_docs)}")
     return {
-        "documents": combined_docs,
+        "documents": unique_docs,
         "question": state["question"],
         "generation": state["generation"],
         "iteration": state["iteration"]
@@ -352,6 +373,16 @@ def analyze_causal_gaps(question, answer, documents):
         Specifically, determine which underlying factors, reasons, or contextual details are missing that would make 
         the causal chain in the answer more comprehensive. Also, look for any contextual fallacies or omissions 
         that might weaken the explanation.
+        
+        Focus on these specific areas:
+        1. COMPARATIVE ANALYSIS: Are there direct comparisons between countries with very different delivery times?
+        2. INFRASTRUCTURE FACTORS: Are there details about logistics infrastructure, transportation networks, or delivery systems?
+        3. REGULATORY ENVIRONMENT: Are there mentions of regulations, customs processes, or legal frameworks that affect delivery?
+        4. CULTURAL FACTORS: Are there considerations of cultural practices, consumer behaviors, or local preferences?
+        5. TEMPORAL ASPECTS: Is there information about how delivery times have changed over time?
+        6. GEOGRAPHICAL CONSIDERATIONS: Are there details about distances, terrain, or population density?
+        7. ECONOMIC FACTORS: Are there mentions of economic conditions, labor costs, or market dynamics?
+        8. TECHNOLOGICAL ADOPTION: Is there information about technology use, automation, or digital infrastructure?
         
         Provide a concise summary in one or two sentences outlining what additional evidence or details are needed 
         to fill these gaps. Make sure not to repeat information already present in the retrieved documents."""),
@@ -428,16 +459,6 @@ def final_synthesis(state):
     }
 
 def grade(state):
-    hallucination_score = hallucination_grader.invoke({
-        "documents": state["documents"],
-        "generation": state["generation"]
-    }).binary_score
-    
-    answer_score = answer_grader.invoke({
-        "question": state["question"],
-        "generation": state["generation"]
-    }).binary_score
-    
     # Generate structured reflection tokens
     reflection = reflection_grader.invoke({
         "question": state["question"],
@@ -493,8 +514,6 @@ def grade(state):
     
     return {
         **state,
-        "hallucination": hallucination_score,
-        "answer": answer_score,
         "iteration": state["iteration"] + 1,
         "reflection": reflection,
         "gap_analysis": gap_analysis,
@@ -581,7 +600,7 @@ workflow.add_node("grade", grade)
 workflow.add_node("generate_subquestions", generate_subquestions)
 workflow.add_node("multi_hop_retrieve", multi_hop_retrieve)
 
-workflow.add_edge("initial_query", "retrieve")
+workflow.add_edge("initial_query", "grade")
 workflow.add_edge("retrieve", "generate")
 workflow.add_edge("generate", "grade")
 workflow.add_conditional_edges("grade", decide_to_continue, {
