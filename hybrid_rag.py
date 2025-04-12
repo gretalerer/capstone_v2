@@ -123,7 +123,7 @@ class GradeAnswer(BaseModel):
 class ReflectionTokens(BaseModel):
     isrel: str = Field(description="'yes' if evidence directly pertains to question, 'no' if not")
     issup: str = Field(description="'yes' if claims are grounded in documents, 'no' if not")
-    isuse: int = Field(description="Score from 1-5 indicating how well the answer provides causal explanation")
+    isuse: int = Field(description="Score from 1-5 indicating how well the answer provides causal explanation: 1=no causal information, 2=basic inferences only, 3=some retrieved data with inferences, 4=comprehensive retrieved data with good inferences, 5=complete causal explanation with multiple data sources")
 
 answer_prompt = ChatPromptTemplate.from_messages([
     ("system", "Assess if the answer explains the question."),
@@ -135,7 +135,12 @@ reflection_prompt = ChatPromptTemplate.from_messages([
     ("system", """Analyze the answer for three aspects:
     1. ISREL: Does the evidence directly pertain to the question?
     2. ISSUP: Is each claim or fact in the answer fully grounded in the retrieved documents?
-    3. ISUSE: Does the answer provide a causal explanation? Rate from 1 (poor) to 5 (comprehensive).
+    3. ISUSE: Does the answer provide a causal explanation? Rate from 1-5 using these specific criteria:
+       - Score 1: No causal information provided, just descriptive facts
+       - Score 2: Basic inferences from internal knowledge only, no retrieved data used for explanation
+       - Score 3: Some retrieved data used with basic inferences, but explanation is incomplete
+       - Score 4: Comprehensive retrieved data with good inferences, but could use more specific examples
+       - Score 5: Complete causal explanation with multiple data sources, specific examples, and clear connections
     
     Return a structured response with these three fields."""),
     ("human", "Question: {question}\nAnswer: {generation}\nDocuments: {documents}")
@@ -278,9 +283,16 @@ def generate(state):
     Your task is to create an IMPROVED answer that:
     1. Builds upon the previous generation (if any) rather than starting from scratch
     2. Incorporates the new information from subquestions to address the identified gaps
-    3. Provides a more comprehensive causal explanation of the observed patterns
+    3. Provides a more comprehensive explanation of the observed patterns
     4. Explicitly connects the new information to the original question
-    5. Highlights how the new information helps explain the "why" behind the patterns
+    5. Highlights how the new information helps explain the patterns
+    
+    BALANCED APPROACH:
+    1. Ground your answer primarily in the factual data from the database
+    2. Supplement with reasonable inferences and insights based on your knowledge
+    3. Clearly distinguish between facts from the data and your inferences
+    4. When making inferences, explain your reasoning and acknowledge uncertainty
+    5. Avoid wild speculation or claims that contradict the data
     
     If this is the first generation (iteration 0), focus on providing a clear, factual answer.
     If this is a subsequent generation (iteration > 0), focus on enhancing the previous answer with new insights.
@@ -357,23 +369,13 @@ def analyze_causal_gaps(question, answer, documents):
     })
 
 def decide_to_continue(state):
-    reflection = state["reflection"]
+    # Use the should_continue flag from the grade function
+    if state.get("should_continue", False):
+        print("\n[ANALYSIS] Answer needs improvement - continuing exploration")
+        return "generate_subquestions"
     
-    # Case A: Evidence is relevant and supported but lacks comprehensive causal explanation
-    if reflection.isrel == "yes" and reflection.issup == "yes" and reflection.isuse < 4:
-        if state["iteration"] < 5:
-            print("\n[ANALYSIS] Answer is factually correct but lacks comprehensive causal explanation")
-            return "generate_subquestions"
-        return "end"
-    
-    # Case B: Evidence is not relevant or not supported
-    elif reflection.isrel == "no" or reflection.issup == "no":
-        if state["iteration"] < 5:
-            print("\n[ANALYSIS] Answer lacks proper evidence support or relevance - regenerating")
-            return "regenerate"
-        return "end"
-    
-    # If we have good evidence and comprehensive explanation, we're done
+    # If we shouldn't continue, we're done
+    print("\n[ANALYSIS] Answer is comprehensive - ending")
     return "end"
 
 def final_synthesis(state):
@@ -382,8 +384,44 @@ def final_synthesis(state):
     base_lower = base.lower()
     sub_docs = [doc for doc in state.get("documents", []) if doc.lower() not in base_lower and "error" not in doc.lower()]
     deduped = list(dict.fromkeys([d.strip() for d in sub_docs]))
-    context = f"Main Answer:\n{base}\n\nAdditional Causal Factors:\n- " + "\n- ".join(deduped[:3])
-    final_answer = rag_chain.invoke({"context": context, "question": state["question"]}).strip()
+    
+    # Create a more structured prompt for the final synthesis
+    synthesis_prompt = f"""
+    You are a data analyst creating a comprehensive answer to the question: "{state['question']}"
+    
+    INITIAL ANSWER:
+    {base}
+    
+    ADDITIONAL INSIGHTS FROM SUBQUESTIONS:
+    {deduped}
+    
+    Your task is to create a FINAL, COMPREHENSIVE answer that:
+    1. Starts with a clear, concise summary of the key findings (the "Core Answer")
+    2. Follows with an "Enhancement" section that incorporates new information from subquestions
+    3. Concludes with a "Comprehensive Explanation" that provides a detailed causal analysis
+    
+    STRUCTURE YOUR ANSWER AS FOLLOWS:
+    
+    **Core Answer:**
+    [Provide a clear, factual summary of the main findings, focusing on the direct answer to the question]
+    
+    **Enhancement with New Information:**
+    [Explain how the new information from subquestions enhances our understanding of the initial answer]
+    
+    **Comprehensive Explanation:**
+    [Provide a detailed causal explanation that:
+     - Identifies multiple factors that contribute to the observed patterns
+     - Explains how these factors interact with each other
+     - Compares and contrasts different countries or scenarios
+     - Draws on specific data points from both the initial answer and subquestions
+     - Acknowledges any limitations or uncertainties in the explanation
+     - Concludes with actionable insights or implications]
+    
+    Your answer should be well-structured, comprehensive, and provide a clear causal explanation for the observed patterns.
+    """
+    
+    final_answer = llm.invoke(synthesis_prompt).content.strip()
+    
     return {
         **state,
         "generation": final_answer
@@ -412,9 +450,44 @@ def grade(state):
     print(f"ISSUP: {reflection.issup}")
     print(f"ISUSE: {reflection.isuse}")
     
+    # Count how many documents were retrieved (excluding the initial answer)
+    retrieved_docs_count = len(state["documents"]) - 1  # Subtract 1 for the initial answer
+    
+    # Calculate a score based on both the reflection and the amount of retrieved information
+    # We want to encourage more retrieval if we haven't gathered enough information yet
+    
+    # Base score on reflection
+    base_score = 0
+    if reflection.isrel == "yes":
+        base_score += 0.3
+    if reflection.issup == "yes":
+        base_score += 0.3
+    
+    # Normalize ISUSE to 0-1 range with stricter criteria
+    # A score of 3 or less should result in a low base score to encourage more retrieval
+    isuse_score = reflection.isuse / 5
+    base_score += isuse_score * 0.4  # ISUSE contributes 40% to base score
+    
+    # Adjust score based on retrieved information
+    # We want at least 3 retrieved documents for a good score
+    retrieval_factor = min(retrieved_docs_count / 3, 1.0)
+    
+    # Final score is a weighted average of base score and retrieval factor
+    # This encourages the system to continue retrieving until it has enough information
+    final_score = (base_score * 0.6) + (retrieval_factor * 0.4)
+    
+    # Determine if we should continue based on the final score and ISUSE score
+    # We want a score of at least 0.8 to consider the answer comprehensive
+    # Also, if ISUSE is 3 or less, we should continue regardless of the final score
+    should_continue = (final_score < 0.8 or reflection.isuse <= 3) and state["iteration"] < 5
+    
+    print(f"[GRADING] Base Score: {base_score:.2f}, Retrieval Factor: {retrieval_factor:.2f}")
+    print(f"[GRADING] Final Score: {final_score:.2f}, Should Continue: {should_continue}")
+    print(f"[GRADING] ISUSE Score: {reflection.isuse}/5, Needs Improvement: {reflection.isuse <= 3}")
+    
     # Generate gap analysis if needed
     gap_analysis = ""
-    if reflection.isrel == "yes" and reflection.issup == "yes" and reflection.isuse < 4:
+    if should_continue:
         gap_analysis = analyze_causal_gaps(state["question"], state["generation"], state["documents"])
         print("[ANALYSIS] Gaps identified:", gap_analysis)
     
@@ -424,7 +497,9 @@ def grade(state):
         "answer": answer_score,
         "iteration": state["iteration"] + 1,
         "reflection": reflection,
-        "gap_analysis": gap_analysis
+        "gap_analysis": gap_analysis,
+        "final_score": final_score,
+        "should_continue": should_continue
     }
 
 def generate_subquestions(state):
@@ -452,7 +527,7 @@ def generate_subquestions(state):
     PREVIOUSLY ASKED QUESTIONS:
     {previous_questions_text}
     
-    Based on the generation, the already retrieved context, and the previously asked questions, formulate 2 NEW follow-up questions that will help EXPLAIN WHY the observed patterns exist.
+    Based on the generation, the already retrieved context, and the previously asked questions, formulate 3 NEW follow-up questions that will help EXPLAIN WHY the observed patterns exist.
     
     IMPORTANT GUIDELINES FOR SUBQUESTIONS:
     1. Each question should investigate a potential CAUSAL FACTOR that might explain the observed patterns
@@ -462,11 +537,17 @@ def generate_subquestions(state):
     5. DO NOT repeat or rephrase questions that have already been asked
     6. Build upon previous questions - if a previous question revealed X, ask about Y that might be related to X
     7. If a previous question didn't yield useful insights, try a different approach or angle
+    8. Consider COMPARATIVE questions that directly compare countries with very different delivery times
+    9. Include questions about INFRASTRUCTURE, REGULATIONS, or CULTURAL FACTORS that might affect delivery times
+    10. Consider TEMPORAL aspects - how delivery times have changed over time in different countries
     
     Examples of GOOD causal questions that build on previous findings:
     - If a previous question showed high delivery times in China: "What is the average distance from distribution centers to delivery locations in China compared to Brazil?"
     - If a previous question showed peak hours impact: "How does the number of available delivery personnel during peak hours (9am-5pm) correlate with delivery times?"
     - If a previous question showed order volume impact: "What is the ratio of orders to available delivery vehicles in each country?"
+    - "How do delivery times in Spain compare to Colombia during peak shopping seasons?"
+    - "What is the correlation between a country's logistics infrastructure score and its average delivery time?"
+    - "How have delivery times changed in the past 5 years in countries with the shortest and longest delivery times?"
     
     Examples of BAD questions:
     - "What is the average delivery time for orders by country?" (already answered in the initial response)
@@ -477,10 +558,11 @@ def generate_subquestions(state):
     Format your response exactly like this:
     1. [First new causal question]
     2. [Second new causal question]
+    3. [Third new causal question]
     
     Do not include any other text or explanations in your response.
     """
-    new_subquestions = llm_fast.invoke(prompt).content.split("\n")[:2]
+    new_subquestions = llm_fast.invoke(prompt).content.split("\n")[:3]
     all_subquestions = state.get("all_subquestions", []) + new_subquestions
     print(f"[SUBQUESTIONS] Subquestions: {new_subquestions}")
     return {
