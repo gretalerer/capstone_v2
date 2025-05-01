@@ -73,13 +73,3 @@ The `eval_RAGBit` directory contains tools for evaluating the RAG system's perfo
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## License
-
-[Add your license information here]
-
-## Acknowledgments
-
-- OpenAI for GPT models
-- LangChain and LangGraph teams
-- Google BigQuery
-- Tavily 
