@@ -41,5 +41,13 @@ wheels/
 # ChromaDB
 chroma_db/
 
-# API Keys
+# API Keys and Results
 *.json 
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.svg
+capstone_key*
+results/
+output/ 
