@@ -4,10 +4,13 @@ from langchain.llms import OpenAI  # or whatever LLM you're using
 from langchain_community.utilities import SQLDatabase
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+import os
 
 load_dotenv()
 
-# Set up Google BigQuery (ensure GOOGLE_APPLICATION_CREDENTIALS is set in .env)
+# Set up Google BigQuery with the correct path to credentials
+credentials_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "capstone-bigquery-key.json")
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
 
 client = bigquery.Client()
 project_id = client.project  
@@ -21,29 +24,30 @@ db = SQLDatabase.from_uri(f"bigquery://{project_id}")
 
 def write_query(question: str) -> str:
     prompt = f"""
-    You are an AI that generates SQL queries for a BigQuery database.
+    You are an expert AI that generates SQL queries for a BigQuery database.
 
     **Database dialect:** {db.dialect}
     **Schema:** {db.get_table_info()}
-    
+
     **User question:** "{question}"
-    
+
     **Rules:**
-    - Write a valid BigQuery SQL query that answers the question
-    - Return only the SQL query, no explanations
-    - Do not assume unknown columns
-    - Sort intelligently based on question intent:
-      * DESC for "highest/most/top"
-      * ASC for "lowest/least/bottom"
-      * By date for trends
-      * By metric for averages/totals
-    - Limit results only when:
-      * Question specifies a number (e.g., "top 5")
-      * Question asks about extremes
-      * Data would be too large
-    
-    Example: SELECT column FROM table ORDER BY metric DESC;
+    - Use only column names and tables present in the schema above.
+    - Join tables as needed using available foreign keys and IDs.
+    - Include WHERE or GROUP BY clauses when the question refers to segments or comparisons.
+    - Sort based on question intent:
+    * DESC for "highest", "most", "top"
+    * ASC for "lowest", "least", "bottom"
+    * By date for trends or changes over time
+    * By relevant metric for averages or totals
+    - Limit rows **only** when:
+    * The question specifies a number (e.g., "top 5")
+    * The question refers to extremes (e.g., "most returned product")
+    * A large number of rows would make the result unreadable
+    - Return only the SQL query — no explanations, no formatting.
+    - If the question cannot be answered with the schema provided, return a comment: `-- Question not answerable with given schema`
     """
+
     raw_result = llm.invoke(prompt)
 
     sql_query = raw_result.content.strip().replace("```sql", "").replace("```", "").strip()

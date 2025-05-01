@@ -25,6 +25,9 @@ import pandas as pd
 from tools.nl2sql_tools import write_query, execute_query, summarize_result
 import numpy as np
 from langchain_core.documents import Document
+import json
+import os.path
+from eval_RAGBit.test_functions import save_gap_analysis_history, track_retrieval_metrics, gap_analysis_history
 
 # %%
 load_dotenv()
@@ -37,6 +40,9 @@ db = SQLDatabase.from_uri(f"bigquery://{project_id}")
 # LLMs
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 llm_fast = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+
+# Global variable to track gap analyses and their corresponding subquestions
+gap_analysis_history = {}
 
 # Define Graph State
 class GraphState(TypedDict):
@@ -224,6 +230,16 @@ def retrieve(state):
     
     # 5. Deduplicate near-duplicate documents - INCREASED threshold from 0.9 to 0.95 to be more lenient
     deduped_docs, deduped_embs = deduplicate_docs(docs_passed, embs_passed, dedup_threshold=0.95)
+    
+    # Track retrieval metrics for noise filtering analysis
+    track_retrieval_metrics(
+        initial_docs=candidate_texts,
+        filtered_docs=docs_passed,
+        deduped_docs=deduped_docs,
+        query=state["question"],
+        similarity_threshold=0.6,
+        dedup_threshold=0.95
+    )
     
     # Combine with existing state's documents
     final_documents = list(state["documents"]) + deduped_docs
@@ -477,34 +493,34 @@ def grade(state):
     # Calculate a score based on both the reflection and the amount of retrieved information
     # We want to encourage more retrieval if we haven't gathered enough information yet
     
-    # Base score on reflection
+    # Base score on reflection - More stringent scoring
     base_score = 0
     if reflection.isrel == "yes":
-        base_score += 0.3
+        base_score += 0.25  # Reduced from 0.3
     if reflection.issup == "yes":
-        base_score += 0.3
+        base_score += 0.25  # Reduced from 0.3
     
     # Normalize ISUSE to 0-1 range with stricter criteria
-    # A score of 3 or less should result in a low base score to encourage more retrieval
+    # A score of 4 or less should result in a low base score to encourage more retrieval
     isuse_score = reflection.isuse / 5
-    base_score += isuse_score * 0.4  # ISUSE contributes 40% to base score
+    base_score += isuse_score * 0.5  # ISUSE contributes 50% to base score (increased from 0.4)
     
     # Adjust score based on retrieved information
-    # We want at least 3 retrieved documents for a good score
-    retrieval_factor = min(retrieved_docs_count / 3, 1.0)
+    # We want at least 5 retrieved documents for a good score (increased from 3)
+    retrieval_factor = min(retrieved_docs_count / 5, 1.0)
     
     # Final score is a weighted average of base score and retrieval factor
     # This encourages the system to continue retrieving until it has enough information
-    final_score = (base_score * 0.6) + (retrieval_factor * 0.4)
+    final_score = (base_score * 0.7) + (retrieval_factor * 0.3)  # Increased weight on base score
     
     # Determine if we should continue based on the final score and ISUSE score
-    # We want a score of at least 0.8 to consider the answer comprehensive
-    # Also, if ISUSE is 3 or less, we should continue regardless of the final score
-    should_continue = (final_score < 0.8 or reflection.isuse <= 3) and state["iteration"] < 5
+    # We want a score of at least 0.85 to consider the answer comprehensive (increased from 0.8)
+    # Also, if ISUSE is 4 or less, we should continue regardless of the final score
+    should_continue = (final_score < 0.85 or reflection.isuse <= 4) and state["iteration"] < 5
     
     print(f"[GRADING] Base Score: {base_score:.2f}, Retrieval Factor: {retrieval_factor:.2f}")
     print(f"[GRADING] Final Score: {final_score:.2f}, Should Continue: {should_continue}")
-    print(f"[GRADING] ISUSE Score: {reflection.isuse}/5, Needs Improvement: {reflection.isuse <= 3}")
+    print(f"[GRADING] ISUSE Score: {reflection.isuse}/5, Needs Improvement: {reflection.isuse <= 4}")
     
     # Generate gap analysis if needed
     gap_analysis = ""
@@ -583,6 +599,20 @@ def generate_subquestions(state):
     """
     new_subquestions = llm_fast.invoke(prompt).content.split("\n")[:3]
     all_subquestions = state.get("all_subquestions", []) + new_subquestions
+    
+    # Update the global gap analysis history
+    if state.get("gap_analysis"):
+        # Use the gap analysis as a key in the dictionary
+        gap_key = state["gap_analysis"]
+        if gap_key not in gap_analysis_history:
+            gap_analysis_history[gap_key] = []
+        
+        # Add the new subquestions to the list for this gap analysis
+        gap_analysis_history[gap_key].extend(new_subquestions)
+        
+        # Save the updated history to the JSON file
+        save_gap_analysis_history()
+    
     print(f"[SUBQUESTIONS] Subquestions: {new_subquestions}")
     return {
         **state,
@@ -615,7 +645,7 @@ workflow.set_entry_point("initial_query")
 app = workflow.compile()
 
 # %%
-initial_state = {"question": "What is the average delivery time for orders by country?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
+initial_state = {"question": "Which product categories generate the highest number of orders overall?", "iteration": 0, "came_from_subq": False, "all_subquestions": []}
 result = app.invoke(initial_state)
 print("Final Answer:", result["generation"])
 print("Documents Used:", result["documents"])
@@ -627,3 +657,4 @@ print("All Subquestions:", result.get("all_subquestions", []))
 mermaid_code = app.get_graph().draw_mermaid()
 print(mermaid_code)
 # %%
+
